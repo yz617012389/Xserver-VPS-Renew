@@ -13,19 +13,23 @@ import re
 import datetime
 from datetime import timezone, timedelta
 import os
+import importlib.util
 import json
 import logging
 from typing import Optional, Dict
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# 尝试兼容两种 playwright-stealth 版本
-try:
+# 尝试兼容两种 playwright-stealth 版本（不使用 try/except 包裹 import）
+_stealth_spec = importlib.util.find_spec("playwright_stealth")
+if _stealth_spec:
     from playwright_stealth import stealth_async
     STEALTH_VERSION = 'old'
-except ImportError:
+else:
     STEALTH_VERSION = 'new'
     stealth_async = None
+
+_aiohttp_available = importlib.util.find_spec("aiohttp") is not None
 
 
 # ======================== 配置 ==========================
@@ -77,8 +81,13 @@ class Notifier:
     async def send_telegram(message: str):
         if not all([Config.TELEGRAM_BOT_TOKEN, Config.TELEGRAM_CHAT_ID]):
             return
+        if not _aiohttp_available:
+            logger.error("❌ 未安装 aiohttp，无法发送 Telegram 通知")
+            return
+
+        import aiohttp
+
         try:
-            import aiohttp
             url = f"https://api.telegram.org/bot{Config.TELEGRAM_BOT_TOKEN}/sendMessage"
             data = {
                 "chat_id": Config.TELEGRAM_CHAT_ID,
@@ -129,9 +138,13 @@ class CaptchaSolver:
 
     async def solve(self, img_data_url: str) -> Optional[str]:
         """使用外部 API 识别验证码"""
-        try:
-            import aiohttp
+        if not _aiohttp_available:
+            logger.error("❌ 未安装 aiohttp，无法调用验证码识别接口")
+            return None
 
+        import aiohttp
+
+        try:
             logger.info(f"📤 发送验证码到 API: {self.api_url}")
 
             max_retries = 3
@@ -191,6 +204,9 @@ class TurnstileSolver:
     async def solve(self, site_key: str, page_url: str, max_wait: int = 120) -> Optional[str]:
         if not self.api_key:
             logger.warning("⚠️ 未配置 YESCAPTCHA_API_KEY，跳过代破解 Turnstile")
+            return None
+        if not _aiohttp_available:
+            logger.error("❌ 未安装 aiohttp，无法调用 YesCaptcha 接口")
             return None
 
         import aiohttp
@@ -553,10 +569,8 @@ Object.defineProperty(navigator, 'permissions', {
             logger.info("🔐 开始 Cloudflare Turnstile 验证流程...")
 
             # 检查是否有 Turnstile
-            has_turnstile = await self.page.evaluate("""
             turnstile_info = await self.page.evaluate("""
                 () => {
-                    return document.querySelector('.cf-turnstile') !== null;
                     const el = document.querySelector('.cf-turnstile');
                     if (!el) return null;
                     return {
@@ -566,7 +580,6 @@ Object.defineProperty(navigator, 'permissions', {
                 }
             """)
 
-            if not has_turnstile:
             if not turnstile_info:
                 logger.info("ℹ️ 未检测到 Cloudflare Turnstile,跳过验证")
                 return True
@@ -635,7 +648,7 @@ Object.defineProperty(navigator, 'permissions', {
                         };
                     }
                 """)
-                
+
                 if iframe_info and iframe_info['visible']:
                     click_x = iframe_info['x'] + 35
                     click_y = iframe_info['y'] + (iframe_info['height'] / 2)
@@ -839,7 +852,7 @@ Object.defineProperty(navigator, 'permissions', {
                         hasToken: tokenField && tokenField.value && tokenField.value.length > 0,
                         tokenValue: tokenField && tokenField.value
                             ? tokenField.value.substring(0, 30) + '...'
-                            : 'empty'
+                            : 'empty',
                     };
                 }
             """)
