@@ -215,7 +215,7 @@ class TurnstileSolver:
             payload = {
                 "clientKey": self.api_key,
                 "task": {
-                    "type": "TurnstileTaskProxyLess",
+                    "type": "TurnstileTaskProxyless",
                     "websiteURL": page_url,
                     "websiteKey": site_key,
                 },
