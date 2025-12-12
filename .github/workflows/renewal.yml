@@ -107,6 +107,7 @@ jobs:
           XSERVER_EMAIL: ${{ secrets.XSERVER_EMAIL }}
           XSERVER_PASSWORD: ${{ secrets.XSERVER_PASSWORD }}
           XSERVER_VPS_ID: ${{ secrets.XSERVER_VPS_ID }}
+          YESCAPTCHA_API_KEY: ${{ secrets.YESCAPTCHA_API_KEY }}
 
           # 🔧 FlareSolverr 配置（使用本地服务）
           FLARESOLVERR_URL: 'http://localhost:8191/v1'
@@ -132,6 +133,7 @@ jobs:
           [ -n "$XSERVER_EMAIL" ] && echo "  ✅ XSERVER_EMAIL: 已配置" || echo "  ❌ XSERVER_EMAIL: 未配置"
           [ -n "$XSERVER_PASSWORD" ] && echo "  ✅ XSERVER_PASSWORD: 已配置" || echo "  ❌ XSERVER_PASSWORD: 未配置"
           [ -n "$XSERVER_VPS_ID" ] && echo "  ✅ XSERVER_VPS_ID: $XSERVER_VPS_ID" || echo "  ❌ XSERVER_VPS_ID: 未配置"
+          [ -n "$YESCAPTCHA_API_KEY" ] && echo "  ✅ YESCAPTCHA_API_KEY: 已配置" || echo "  ⚠️ YESCAPTCHA_API_KEY: 未配置（Turnstile 将无法自动破解）"
           [ -n "$CAPTCHA_API_URL" ] && echo "  ✅ CAPTCHA_API_URL: 已配置" || echo "  ⚠️ CAPTCHA_API_URL: 未配置（将使用默认）"
           [ -n "$FLARESOLVERR_URL" ] && echo "  ✅ FlareSolverr: $FLARESOLVERR_URL" || echo "  ❌ FlareSolverr: 未配置"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
