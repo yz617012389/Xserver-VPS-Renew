@@ -50,6 +50,9 @@ class Config:
         "https://captcha-120546510085.asia-northeast1.run.app"
     )
 
+    # https://yescaptcha.com Turnstile 代破解 API Key
+    YESCAPTCHA_API_KEY = os.getenv("YESCAPTCHA_API_KEY")
+
     DETAIL_URL = f"https://secure.xserver.ne.jp/xapanel/xvps/server/detail?id={VPS_ID}"
     EXTEND_URL = f"https://secure.xserver.ne.jp/xapanel/xvps/server/freevps/extend/index?id_vps={VPS_ID}"
 
@@ -176,6 +179,74 @@ class CaptchaSolver:
         return None
 
 
+class TurnstileSolver:
+    """使用 https://yescaptcha.com 代破解 Cloudflare Turnstile"""
+
+    CREATE_TASK_URL = "https://api.yescaptcha.com/createTask"
+    RESULT_URL = "https://api.yescaptcha.com/getTaskResult"
+
+    def __init__(self):
+        self.api_key = Config.YESCAPTCHA_API_KEY
+
+    async def solve(self, site_key: str, page_url: str, max_wait: int = 120) -> Optional[str]:
+        if not self.api_key:
+            logger.warning("⚠️ 未配置 YESCAPTCHA_API_KEY，跳过代破解 Turnstile")
+            return None
+
+        import aiohttp
+
+        try:
+            payload = {
+                "clientKey": self.api_key,
+                "task": {
+                    "type": "TurnstileTaskProxyLess",
+                    "websiteURL": page_url,
+                    "websiteKey": site_key,
+                },
+                "softID": 36,  # 官方示例中的标识，可帮助追踪
+            }
+
+            logger.info("📤 发送 Turnstile 代破解任务至 YesCaptcha...")
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.CREATE_TASK_URL, json=payload, timeout=30) as resp:
+                    data = await resp.json()
+                    if data.get("errorId") != 0:
+                        raise Exception(data.get("errorDescription", "创建任务失败"))
+
+                    task_id = data.get("taskId")
+                    logger.info(f"🆔 YesCaptcha 任务已创建: {task_id}")
+
+                # 轮询获取结果
+                start_time = datetime.datetime.utcnow()
+                while (datetime.datetime.utcnow() - start_time).total_seconds() < max_wait:
+                    await asyncio.sleep(5)
+                    async with session.post(
+                        self.RESULT_URL,
+                        json={"clientKey": self.api_key, "taskId": task_id},
+                        timeout=20,
+                    ) as resp:
+                        result = await resp.json()
+                        if result.get("errorId") != 0:
+                            raise Exception(result.get("errorDescription", "查询任务失败"))
+
+                        if result.get("status") == "ready":
+                            solution = result.get("solution", {})
+                            token = solution.get("token")
+                            if token:
+                                logger.info("✅ YesCaptcha 返回 Turnstile token")
+                                return token
+                        else:
+                            logger.info("⏳ 等待 YesCaptcha 返回结果...")
+
+                logger.error("❌ YesCaptcha 轮询超时，未获取到 token")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ YesCaptcha 处理 Turnstile 失败: {e}")
+            return None
+
+
 # ======================== 核心类 ==========================
 
 class XServerVPSRenewal:
@@ -191,6 +262,7 @@ class XServerVPSRenewal:
         self.error_message: Optional[str] = None
 
         self.captcha_solver = CaptchaSolver()
+        self.turnstile_solver = TurnstileSolver()
 
     # ---------- 缓存 ----------
     def load_cache(self) -> Optional[Dict]:
@@ -482,14 +554,62 @@ Object.defineProperty(navigator, 'permissions', {
 
             # 检查是否有 Turnstile
             has_turnstile = await self.page.evaluate("""
+            turnstile_info = await self.page.evaluate("""
                 () => {
                     return document.querySelector('.cf-turnstile') !== null;
+                    const el = document.querySelector('.cf-turnstile');
+                    if (!el) return null;
+                    return {
+                        hasTurnstile: true,
+                        sitekey: el.getAttribute('data-sitekey'),
+                    };
                 }
             """)
 
             if not has_turnstile:
+            if not turnstile_info:
                 logger.info("ℹ️ 未检测到 Cloudflare Turnstile,跳过验证")
                 return True
+
+            site_key = turnstile_info.get('sitekey')
+            page_url = self.page.url
+
+            # 优先使用 YesCaptcha 代破解
+            token = None
+            if site_key:
+                logger.info(f"🔑 检测到 Turnstile sitekey: {site_key}")
+                token = await self.turnstile_solver.solve(site_key, page_url, max_wait=max_wait)
+
+            if token:
+                injected = await self.page.evaluate("""
+                    (tokenValue) => {
+                        const input = document.querySelector('[name="cf-turnstile-response"]') ||
+                            document.querySelector('#cf-turnstile-response');
+                        if (input) {
+                            input.value = tokenValue;
+                            input.dispatchEvent(new Event('input', { bubbles: true }));
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                        if (window.turnstile && typeof window.turnstile.ready === 'function') {
+                            try {
+                                window.turnstile.ready(() => {
+                                    try {
+                                        window.turnstile.render('.cf-turnstile', {
+                                            callback: () => tokenValue,
+                                        });
+                                    } catch (err) {}
+                                });
+                            } catch (err) {}
+                        }
+                        return !!input;
+                    }
+                """, token)
+
+                if injected:
+                    logger.info("✅ 已将 YesCaptcha 生成的 token 注入页面")
+                    return True
+                else:
+                    logger.warning("⚠️ 未能注入 token，尝试人工触发方案")
 
             logger.info("🔍 检测到 Turnstile,尝试多种方法触发验证...")
 
@@ -515,7 +635,7 @@ Object.defineProperty(navigator, 'permissions', {
                         };
                     }
                 """)
-
+                
                 if iframe_info and iframe_info['visible']:
                     click_x = iframe_info['x'] + 35
                     click_y = iframe_info['y'] + (iframe_info['height'] / 2)
