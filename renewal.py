@@ -215,6 +215,7 @@ class TurnstileSolver:
             payload = {
                 "clientKey": self.api_key,
                 "task": {
+                    # 使用官方文档中的正确任务类型，避免返回“任务类型不正确或不受支持”
                     "type": "TurnstileTaskProxyless",
                     "websiteURL": page_url,
                     "websiteKey": site_key,
@@ -436,7 +437,7 @@ Object.defineProperty(navigator, 'permissions', {
                     for (const row of rows) {
                         const text = row.innerText || row.textContent;
                         if (text.includes('利用期限') && !text.includes('利用開始')) {
-                            const match = text.match(/(\\d{4})年(\\d{1,2})月(\\d{1,2})日/);
+                            const match = text.match(/(\d{4})年(\d{1,2})月(\d{1,2})日/);
                             if (match) return {year: match[1], month: match[2], day: match[3]};
                         }
                     }
@@ -869,37 +870,10 @@ Object.defineProperty(navigator, 'permissions', {
 
     # ---------- 提交续期表单 ----------
     async def submit_extend(self) -> bool:
-        """提交续期表单 - 先完成 Turnstile, 再处理验证码并提交"""
-        try:
-            logger.info("📄 开始提交续期表单")
-            await asyncio.sleep(3)
+        """提交续期表单 - 支持在失败/未知时自动重试一次"""
 
-            # 在续期页面先模拟一些“人类行为”
-            logger.info("👤 在续期页面模拟用户行为以辅助 Turnstile 通过...")
-            try:
-                await self.page.mouse.move(50, 50, steps=25)
-                await asyncio.sleep(0.7)
-                await self.page.mouse.move(200, 160, steps=20)
-                await asyncio.sleep(0.6)
-                await self.page.evaluate("window.scrollBy(0, 300)")
-                await asyncio.sleep(0.8)
-                await self.page.evaluate("window.scrollBy(0, -200)")
-                await asyncio.sleep(0.6)
-            except Exception:
-                pass
-
-            # 步骤 1: Turnstile
-            logger.info("🔐 步骤1: 完成 Cloudflare Turnstile 验证...")
-            turnstile_success = await self.complete_turnstile_verification(max_wait=90)
-
-            if not turnstile_success:
-                logger.warning("⚠️ Turnstile 验证未完全确认,但继续尝试提交...")
-
-            await asyncio.sleep(2)
-
-            # 步骤 2: 获取并识别验证码图片
-            logger.info("🔍 步骤2: 查找验证码图片...")
-            img_data_url = await self.page.evaluate("""
+        async def _read_captcha_image() -> Optional[str]:
+            return await self.page.evaluate("""
                 () => {
                     const img =
                       document.querySelector('img[src^="data:image"]') ||
@@ -907,36 +881,20 @@ Object.defineProperty(navigator, 'permissions', {
                       document.querySelector('img[alt="画像認証"]') ||
                       document.querySelector('img');
                     if (!img || !img.src) {
-                        throw new Error('未找到验证码图片');
+                        return null;
                     }
                     return img.src;
                 }
             """)
 
-            if not img_data_url:
-                logger.info("ℹ️ 无验证码,可能未到续期时间")
-                self.renewal_status = "Unexpired"
-                return False
-
-            logger.info("📸 已找到验证码图片,正在发送到 API 进行识别...")
-            await self.shot("08_captcha_found")
-
-            code = await self.captcha_solver.solve(img_data_url)
-            if not code:
-                logger.error("❌ 验证码识别失败")
-                self.renewal_status = "Failed"
-                self.error_message = "验证码识别失败"
-                return False
-
-            # 步骤 3: 填写验证码
-            logger.info(f"⌨️ 步骤3: 填写验证码: {code}")
-            input_filled = await self.page.evaluate("""
+        async def _fill_captcha(code: str) -> bool:
+            return await self.page.evaluate("""
                 (code) => {
                     const input =
                       document.querySelector('[placeholder*="上の画像"]') ||
                       document.querySelector('input[type="text"]');
                     if (!input) {
-                        throw new Error('未找到验证码输入框');
+                        return false;
                     }
                     input.value = code;
                     input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -945,107 +903,174 @@ Object.defineProperty(navigator, 'permissions', {
                 }
             """, code)
 
-            if not input_filled:
-                raise Exception("未找到验证码输入框")
+        try:
+            max_attempts = 2
+            for attempt in range(1, max_attempts + 1):
+                logger.info(f"📄 开始提交续期表单 (尝试 {attempt}/{max_attempts})")
+                await asyncio.sleep(3)
 
-            await asyncio.sleep(2)
-            await self.shot("09_captcha_filled")
+                if attempt > 1:
+                    logger.info("🔄 正在刷新续期页面以获取新验证码和 Turnstile 状态...")
+                    await self.page.reload()
+                    await asyncio.sleep(3)
 
-            # 再模拟少量鼠标行为
-            try:
-                await self.page.mouse.move(270, 300, steps=30)
-                await asyncio.sleep(0.9)
-                await self.page.mouse.move(420, 260, steps=20)
-                await asyncio.sleep(0.7)
-            except Exception:
-                pass
+                # 在续期页面先模拟一些“人类行为”
+                logger.info("👤 在续期页面模拟用户行为以辅助 Turnstile 通过...")
+                try:
+                    await self.page.mouse.move(50, 50, steps=25)
+                    await asyncio.sleep(0.7)
+                    await self.page.mouse.move(200, 160, steps=20)
+                    await asyncio.sleep(0.6)
+                    await self.page.evaluate("window.scrollBy(0, 300)")
+                    await asyncio.sleep(0.8)
+                    await self.page.evaluate("window.scrollBy(0, -200)")
+                    await asyncio.sleep(0.6)
+                except Exception:
+                    pass
 
-            # 步骤 4: 最终确认 Turnstile 令牌
-            logger.info("🔍 步骤4: 最终确认 Turnstile 令牌...")
-            final_check = await self.page.evaluate("""
-                () => {
-                    const tokenField = document.querySelector('[name="cf-turnstile-response"]');
-                    const successText = document.body.innerText || document.body.textContent;
-                    return {
-                        hasToken: tokenField && tokenField.value && tokenField.value.length > 0,
-                        tokenLength: tokenField && tokenField.value ? tokenField.value.length : 0,
-                        hasSuccessText: successText.includes('成功')
-                    };
-                }
-            """)
+                # 步骤 1: Turnstile
+                logger.info("🔐 步骤1: 完成 Cloudflare Turnstile 验证...")
+                turnstile_success = await self.complete_turnstile_verification(max_wait=90)
 
-            if final_check['hasToken']:
-                logger.info(
-                    f"✅ Turnstile 令牌确认 (长度: {final_check['tokenLength']}, "
-                    f"成功标志: {final_check['hasSuccessText']})"
-                )
-            else:
-                logger.warning("⚠️ Turnstile 令牌缺失,提交可能失败")
+                if not turnstile_success:
+                    logger.warning("⚠️ Turnstile 验证未完全确认,但继续尝试提交...")
 
-            await asyncio.sleep(1)
+                await asyncio.sleep(2)
 
-            # 步骤 5: 提交表单
-            logger.info("🖱️ 步骤5: 提交表单...")
-            await self.shot("10_before_submit")
+                # 步骤 2: 获取并识别验证码图片
+                logger.info("🔍 步骤2: 查找验证码图片...")
+                img_data_url = await _read_captcha_image()
 
-            submitted = await self.page.evaluate("""
-                () => {
-                    if (typeof window.submit_button !== 'undefined' &&
-                        window.submit_button &&
-                        typeof window.submit_button.click === 'function') {
-                        window.submit_button.click();
-                        return true;
+                if not img_data_url:
+                    logger.info("ℹ️ 无验证码,可能未到续期时间")
+                    self.renewal_status = "Unexpired"
+                    return False
+
+                logger.info("📸 已找到验证码图片,正在发送到 API 进行识别...")
+                await self.shot(f"08_captcha_found_attempt_{attempt}")
+
+                code = await self.captcha_solver.solve(img_data_url)
+                if not code:
+                    logger.error("❌ 验证码识别失败")
+                    self.renewal_status = "Failed"
+                    self.error_message = "验证码识别失败"
+                    if attempt < max_attempts:
+                        logger.info("🔁 将在下一次尝试中重新识别验证码")
+                        continue
+                    return False
+
+                # 步骤 3: 填写验证码
+                logger.info(f"⌨️ 步骤3: 填写验证码: {code}")
+                input_filled = await _fill_captcha(code)
+
+                if not input_filled:
+                    raise Exception("未找到验证码输入框")
+
+                await asyncio.sleep(2)
+                await self.shot(f"09_captcha_filled_attempt_{attempt}")
+
+                # 再模拟少量鼠标行为
+                try:
+                    await self.page.mouse.move(270, 300, steps=30)
+                    await asyncio.sleep(0.9)
+                    await self.page.mouse.move(420, 260, steps=20)
+                    await asyncio.sleep(0.7)
+                except Exception:
+                    pass
+
+                # 步骤 4: 最终确认 Turnstile 令牌
+                logger.info("🔍 步骤4: 最终确认 Turnstile 令牌...")
+                final_check = await self.page.evaluate("""
+                    () => {
+                        const tokenField = document.querySelector('[name="cf-turnstile-response"]');
+                        const successText = document.body.innerText || document.body.textContent;
+                        return {
+                            hasToken: tokenField && tokenField.value && tokenField.value.length > 0,
+                            tokenLength: tokenField && tokenField.value ? tokenField.value.length : 0,
+                            hasSuccessText: successText.includes('成功')
+                        };
                     }
-                    const submitBtn =
-                      document.querySelector('input[type="submit"], button[type="submit"]');
-                    if (submitBtn) {
-                        submitBtn.click();
-                        return true;
+                """)
+
+                if final_check['hasToken']:
+                    logger.info(
+                        f"✅ Turnstile 令牌确认 (长度: {final_check['tokenLength']}, "
+                        f"成功标志: {final_check['hasSuccessText']})"
+                    )
+                else:
+                    logger.warning("⚠️ Turnstile 令牌缺失,提交可能失败")
+
+                await asyncio.sleep(1)
+
+                # 步骤 5: 提交表单
+                logger.info("🖱️ 步骤5: 提交表单...")
+                await self.shot(f"10_before_submit_attempt_{attempt}")
+
+                submitted = await self.page.evaluate("""
+                    () => {
+                        if (typeof window.submit_button !== 'undefined' &&
+                            window.submit_button &&
+                            typeof window.submit_button.click === 'function') {
+                            window.submit_button.click();
+                            return true;
+                        }
+                        const submitBtn =
+                          document.querySelector('input[type="submit"], button[type="submit"]');
+                        if (submitBtn) {
+                            submitBtn.click();
+                            return true;
+                        }
+                        return false;
                     }
-                    return false;
-                }
-            """)
+                """)
 
-            if not submitted:
-                logger.error("❌ 无法提交表单")
-                raise Exception("无法提交表单")
+                if not submitted:
+                    logger.error("❌ 无法提交表单")
+                    raise Exception("无法提交表单")
 
-            logger.info("✅ 表单已提交")
-            await asyncio.sleep(5)
-            await self.shot("11_after_submit")
+                logger.info("✅ 表单已提交")
+                await asyncio.sleep(5)
+                await self.shot(f"11_after_submit_attempt_{attempt}")
 
-            html = await self.page.content()
+                html = await self.page.content()
 
-            # 错误提示
-            if any(err in html for err in [
-                "入力された認証コードが正しくありません",
-                "認証コードが正しくありません",
-                "エラー",
-                "間違"
-            ]):
-                logger.error("❌ 验证码错误或 Turnstile 验证失败")
-                await self.shot("11_error")
-                self.renewal_status = "Failed"
-                self.error_message = "验证码错误或 Turnstile 验证失败"
+                # 错误提示
+                if any(err in html for err in [
+                    "入力された認証コードが正しくありません",
+                    "認証コードが正しくありません",
+                    "エラー",
+                    "間違"
+                ]):
+                    logger.error("❌ 验证码错误或 Turnstile 验证失败")
+                    await self.shot(f"11_error_attempt_{attempt}")
+                    if attempt < max_attempts:
+                        logger.info("🔁 检测到错误，准备重新刷新验证码并重试提交")
+                        continue
+                    self.renewal_status = "Failed"
+                    self.error_message = "验证码错误或 Turnstile 验证失败"
+                    return False
+
+                # 成功提示
+                if any(success in html for success in [
+                    "完了",
+                    "継続",
+                    "完成",
+                    "更新しました"
+                ]):
+                    logger.info("🎉 续期成功")
+                    self.renewal_status = "Success"
+                    # 再查一次新的到期日期
+                    await self.get_expiry()
+                    self.new_expiry_time = self.old_expiry_time
+                    return True
+
+                logger.warning("⚠️ 续期提交结果未知")
+                if attempt < max_attempts:
+                    logger.info("🔁 结果未知，尝试重新提交一次...")
+                    continue
+
+                self.renewal_status = "Unknown"
                 return False
-
-            # 成功提示
-            if any(success in html for success in [
-                "完了",
-                "継続",
-                "完成",
-                "更新しました"
-            ]):
-                logger.info("🎉 续期成功")
-                self.renewal_status = "Success"
-                # 再查一次新的到期日期
-                await self.get_expiry()
-                self.new_expiry_time = self.old_expiry_time
-                return True
-
-            logger.warning("⚠️ 续期提交结果未知")
-            self.renewal_status = "Unknown"
-            return False
 
         except Exception as e:
             logger.error(f"❌ 续期错误: {e}")
@@ -1053,41 +1078,6 @@ Object.defineProperty(navigator, 'permissions', {
             self.error_message = str(e)
             return False
 
-    # ---------- README 生成 ----------
-    def generate_readme(self):
-        now = datetime.datetime.now(timezone(timedelta(hours=8)))  # 显示为 UTC+8
-        ts = now.strftime("%Y-%m-%d %H:%M:%S")
-
-        out = "# XServer VPS 自动续期状态\n\n"
-        out += f"**运行时间**: `{ts} (UTC+8)`<br>\n"
-        out += f"**VPS ID**: `{Config.VPS_ID}`<br>\n\n---\n\n"
-
-        if self.renewal_status == "Success":
-            out += (
-                "## ✅ 续期成功\n\n"
-                f"- 🕛 **旧到期**: `{self.old_expiry_time}`\n"
-                f"- 🕡 **新到期**: `{self.new_expiry_time}`\n"
-            )
-        elif self.renewal_status == "Unexpired":
-            out += (
-                "## ℹ️ 尚未到期\n\n"
-                f"- 🕛 **到期时间**: `{self.old_expiry_time}`\n"
-            )
-        else:
-            out += (
-                "## ❌ 续期失败\n\n"
-                f"- 🕛 **到期**: `{self.old_expiry_time or '未知'}`\n"
-                f"- ⚠️ **错误**: {self.error_message or '未知'}\n"
-            )
-
-        out += f"\n---\n\n*最后更新: {ts}*\n"
-
-        with open("README.md", "w", encoding="utf-8") as f:
-            f.write(out)
-
-        logger.info("📄 README.md 已更新")
-
-    # ---------- 主流程 ----------
     async def run(self):
         try:
             logger.info("=" * 60)
