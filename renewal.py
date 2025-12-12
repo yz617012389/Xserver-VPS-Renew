@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 """
-XServer VPS 自动续期脚本（增强版）
-- 优化：Cloudflare Turnstile 验证处理顺序
-- 改进：强制关闭无头模式 + 注入 anti-bot 脚本 + 增强“人类行为”模拟
-- 新增：自动判断是否已续期 / 尚未到可续期日期（按 JST），避免重复续期
+XServer VPS 自动续期脚本（修复版）
+- 修复：添加缺失的 generate_readme() 方法
+- 优化：Turnstile token 注入时机和方式
+- 改进：增加表单提交前的等待时间，确保 token 生效
 """
 
 import asyncio
@@ -20,7 +20,7 @@ from typing import Optional, Dict
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# 尝试兼容两种 playwright-stealth 版本（不使用 try/except 包裹 import）
+# 尝试兼容两种 playwright-stealth 版本
 _stealth_spec = importlib.util.find_spec("playwright_stealth")
 if _stealth_spec:
     from playwright_stealth import stealth_async
@@ -39,14 +39,12 @@ class Config:
     LOGIN_PASSWORD = os.getenv("XSERVER_PASSWORD")
     VPS_ID = os.getenv("XSERVER_VPS_ID", "40124478")
 
-    # 原来的 USE_HEADLESS 在 Turnstile 下不再生效，这里保留但会强制改为 False
     USE_HEADLESS = os.getenv("USE_HEADLESS", "true").lower() == "true"
     WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", "30000"))
 
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-    # 仅支持带 schema 的简单代理，如 socks5://ip:port 或 http://ip:port
     PROXY_SERVER = os.getenv("PROXY_SERVER")
 
     CAPTCHA_API_URL = os.getenv(
@@ -54,7 +52,6 @@ class Config:
         "https://captcha-120546510085.asia-northeast1.run.app"
     )
 
-    # https://yescaptcha.com Turnstile 代破解 API Key
     YESCAPTCHA_API_KEY = os.getenv("YESCAPTCHA_API_KEY")
 
     DETAIL_URL = f"https://secure.xserver.ne.jp/xapanel/xvps/server/detail?id={VPS_ID}"
@@ -105,7 +102,6 @@ class Notifier:
 
     @staticmethod
     async def notify(subject: str, message: str):
-        # 目前只使用 Telegram（subject 仅预留，不使用）
         await Notifier.send_telegram(message)
 
 
@@ -215,12 +211,11 @@ class TurnstileSolver:
             payload = {
                 "clientKey": self.api_key,
                 "task": {
-                    # 使用官方文档中的正确任务类型，避免返回“任务类型不正确或不受支持”
                     "type": "TurnstileTaskProxyless",
                     "websiteURL": page_url,
                     "websiteKey": site_key,
                 },
-                "softID": 36,  # 官方示例中的标识，可帮助追踪
+                "softID": 36,
             }
 
             logger.info("📤 发送 Turnstile 代破解任务至 YesCaptcha...")
@@ -271,7 +266,7 @@ class XServerVPSRenewal:
         self.browser = None
         self.context = None
         self.page = None
-        self._pw = None  # 保存 playwright 实例，方便关闭
+        self._pw = None
 
         self.renewal_status: str = "Unknown"
         self.old_expiry_time: Optional[str] = None
@@ -304,6 +299,49 @@ class XServerVPSRenewal:
         except Exception as e:
             logger.error(f"保存缓存失败: {e}")
 
+    # ---------- 生成 README ----------
+    def generate_readme(self):
+        """生成 README.md 文件"""
+        try:
+            status_emoji = {
+                "Success": "✅",
+                "Failed": "❌",
+                "Unexpired": "ℹ️",
+                "Unknown": "❓"
+            }
+            
+            emoji = status_emoji.get(self.renewal_status, "❓")
+            
+            readme_content = f"""# XServer VPS 自动续期状态
+
+## 📊 最新状态
+
+**状态**: {emoji} {self.renewal_status}  
+**检查时间**: {datetime.datetime.now(timezone(timedelta(hours=9))).strftime('%Y-%m-%d %H:%M:%S JST')}  
+**VPS ID**: {Config.VPS_ID}
+
+## 📅 到期信息
+
+- **当前到期时间**: {self.old_expiry_time or '未知'}
+- **新到期时间**: {self.new_expiry_time or '未更新'}
+
+## ⚠️ 错误信息
+
+{self.error_message or '无'}
+
+---
+
+*此文件由自动化脚本生成*
+"""
+            
+            with open("README.md", "w", encoding="utf-8") as f:
+                f.write(readme_content)
+            
+            logger.info("✅ README.md 已生成")
+            
+        except Exception as e:
+            logger.error(f"❌ 生成 README 失败: {e}")
+
     # ---------- 截图 ----------
     async def shot(self, name: str):
         """安全截图,不影响主流程"""
@@ -328,13 +366,11 @@ class XServerVPSRenewal:
                 "--start-maximized",
             ]
 
-            # 代理（只支持简单 proxy-server 写法）
             proxy_url = None
             if Config.PROXY_SERVER:
                 proxy_url = Config.PROXY_SERVER
                 logger.info(f"🌐 使用代理: {Config.PROXY_SERVER}")
 
-            # 强制关闭无头模式
             if Config.USE_HEADLESS:
                 logger.info("⚠️ 为了通过 Turnstile，强制使用非无头模式(headless=False)")
             else:
@@ -344,7 +380,7 @@ class XServerVPSRenewal:
                 launch_args.append(f"--proxy-server={proxy_url}")
 
             launch_kwargs = {
-                "headless": False,   # ★ 关键：强制关闭 headless
+                "headless": False,
                 "args": launch_args
             }
 
@@ -363,7 +399,6 @@ class XServerVPSRenewal:
 
             self.context = await self.browser.new_context(**context_options)
 
-            # Anti-bot 注入：去掉 webdriver、补全 plugins / languages / permissions
             await self.context.add_init_script("""
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
@@ -378,7 +413,6 @@ Object.defineProperty(navigator, 'permissions', {
             self.page = await self.context.new_page()
             self.page.set_default_timeout(Config.WAIT_TIMEOUT)
 
-            # 旧版 stealth 支持
             if STEALTH_VERSION == 'old' and stealth_async is not None:
                 await stealth_async(self.page)
             else:
@@ -402,7 +436,6 @@ Object.defineProperty(navigator, 'permissions', {
             await asyncio.sleep(2)
             await self.shot("01_login")
 
-            # 填写账号密码
             await self.page.fill("input[name='memberid']", Config.LOGIN_EMAIL)
             await self.page.fill("input[name='user_password']", Config.LOGIN_PASSWORD)
             await self.shot("02_before_submit")
@@ -491,7 +524,6 @@ Object.defineProperty(navigator, 'permissions', {
             await asyncio.sleep(2)
             await self.shot("05_before_extend")
 
-            # 方法 1: 按钮
             try:
                 logger.info("🔍 方法1: 查找续期按钮(按钮)...")
                 await self.page.click(
@@ -505,7 +537,6 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception as e1:
                 logger.info(f"ℹ️ 方法1失败(按钮): {e1}")
 
-            # 方法 1b: 链接
             try:
                 logger.info("🔍 方法1b: 尝试链接形式...")
                 await self.page.click(
@@ -519,7 +550,6 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception as e1b:
                 logger.info(f"ℹ️ 方法1b失败(链接): {e1b}")
 
-            # 方法 2: 直接访问续期 URL
             try:
                 logger.info("🔍 方法2: 直接访问续期URL...")
                 await self.page.goto(Config.EXTEND_URL, timeout=Config.WAIT_TIMEOUT)
@@ -563,314 +593,86 @@ Object.defineProperty(navigator, 'permissions', {
             logger.warning(f"⚠️ 打开续期页面异常: {e}")
             return False
 
-    # ---------- Turnstile 高级处理 ----------
-    async def complete_turnstile_verification(self, max_wait: int = 120) -> bool:
-        """使用多种方法尝试完成 Cloudflare Turnstile 验证"""
+    # ---------- Turnstile 处理（优化版）---------- 
+    async def inject_turnstile_token(self, token: str) -> bool:
+        """改进的 Turnstile token 注入方法"""
         try:
-            logger.info("🔐 开始 Cloudflare Turnstile 验证流程...")
-
-            # 检查是否有 Turnstile
-            turnstile_info = await self.page.evaluate("""
+            logger.info("🔧 开始注入 Turnstile token...")
+            
+            # 方法1: 直接设置 input 值
+            success1 = await self.page.evaluate("""
+                (tokenValue) => {
+                    const input = document.querySelector('[name="cf-turnstile-response"]');
+                    if (input) {
+                        input.value = tokenValue;
+                        input.dispatchEvent(new Event('input', { bubbles: true }));
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                        return true;
+                    }
+                    return false;
+                }
+            """, token)
+            
+            if success1:
+                logger.info("✅ 方法1: 已注入 input[name='cf-turnstile-response']")
+            
+            # 方法2: 尝试通过 window.turnstile API
+            success2 = await self.page.evaluate("""
+                (tokenValue) => {
+                    if (window.turnstile && window.turnstile.reset) {
+                        try {
+                            const widgets = document.querySelectorAll('.cf-turnstile');
+                            widgets.forEach((widget, idx) => {
+                                try {
+                                    window.turnstile.reset(idx);
+                                } catch(e) {}
+                            });
+                        } catch(e) {}
+                    }
+                    return false;
+                }
+            """, token)
+            
+            # 方法3: 设置隐藏的 response 字段
+            success3 = await self.page.evaluate("""
+                (tokenValue) => {
+                    const responses = document.querySelectorAll('input[name*="turnstile"], input[id*="turnstile"]');
+                    let found = false;
+                    responses.forEach(input => {
+                        input.value = tokenValue;
+                        found = true;
+                    });
+                    return found;
+                }
+            """, token)
+            
+            if success3:
+                logger.info("✅ 方法3: 已注入其他 turnstile 相关字段")
+            
+            # 验证注入结果
+            await asyncio.sleep(2)
+            verification = await self.page.evaluate("""
                 () => {
-                    const el = document.querySelector('.cf-turnstile');
-                    if (!el) return null;
+                    const input = document.querySelector('[name="cf-turnstile-response"]');
                     return {
-                        hasTurnstile: true,
-                        sitekey: el.getAttribute('data-sitekey'),
+                        hasInput: !!input,
+                        hasValue: input && input.value && input.value.length > 0,
+                        valueLength: input && input.value ? input.value.length : 0
                     };
                 }
             """)
-
-            if not turnstile_info:
-                logger.info("ℹ️ 未检测到 Cloudflare Turnstile,跳过验证")
-                return True
-
-            site_key = turnstile_info.get('sitekey')
-            page_url = self.page.url
-
-            # 优先使用 YesCaptcha 代破解
-            token = None
-            if site_key:
-                logger.info(f"🔑 检测到 Turnstile sitekey: {site_key}")
-                token = await self.turnstile_solver.solve(site_key, page_url, max_wait=max_wait)
-
-            if token:
-                injected = await self.page.evaluate("""
-                    (tokenValue) => {
-                        const input = document.querySelector('[name="cf-turnstile-response"]') ||
-                            document.querySelector('#cf-turnstile-response');
-                        if (input) {
-                            input.value = tokenValue;
-                            input.dispatchEvent(new Event('input', { bubbles: true }));
-                            input.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                        if (window.turnstile && typeof window.turnstile.ready === 'function') {
-                            try {
-                                window.turnstile.ready(() => {
-                                    try {
-                                        window.turnstile.render('.cf-turnstile', {
-                                            callback: () => tokenValue,
-                                        });
-                                    } catch (err) {}
-                                });
-                            } catch (err) {}
-                        }
-                        return !!input;
-                    }
-                """, token)
-
-                if injected:
-                    logger.info("✅ 已将 YesCaptcha 生成的 token 注入页面")
-                    return True
-                else:
-                    logger.warning("⚠️ 未能注入 token，尝试人工触发方案")
-
-            logger.info("🔍 检测到 Turnstile,尝试多种方法触发验证...")
-
-            # 方法1: 获取 iframe 并尝试坐标点击
-            try:
-                await asyncio.sleep(3)
-
-                iframe_info = await self.page.evaluate("""
-                    () => {
-                        const container = document.querySelector('.cf-turnstile');
-                        if (!container) return null;
-
-                        const iframe = container.querySelector('iframe');
-                        if (!iframe) return null;
-
-                        const rect = iframe.getBoundingClientRect();
-                        return {
-                            x: rect.x,
-                            y: rect.y,
-                            width: rect.width,
-                            height: rect.height,
-                            visible: rect.width > 0 && rect.height > 0
-                        };
-                    }
-                """)
-
-                if iframe_info and iframe_info['visible']:
-                    click_x = iframe_info['x'] + 35
-                    click_y = iframe_info['y'] + (iframe_info['height'] / 2)
-
-                    logger.info(f"🖱️ 方法1: 点击 iframe 坐标 ({click_x:.0f}, {click_y:.0f})")
-                    await self.page.mouse.click(click_x, click_y)
-                    await asyncio.sleep(2)
-                    await self.shot("07_method1_clicked")
-                else:
-                    logger.info("⚠️ 方法1: 无法获取 iframe 位置")
-
-            except Exception as e:
-                logger.info(f"ℹ️ 方法1 失败: {e}")
-
-            # 方法2: 使用 CDP 注入脚本到所有 frame
-            try:
-                logger.info("🔧 方法2: 使用 CDP 注入到所有 frames...")
-
-                cdp = await self.page.context.new_cdp_session(self.page)
-                await cdp.send('Runtime.enable')
-
-                frames_data = await cdp.send('Page.getFrameTree')
-
-                def collect_frame_ids(frame_tree):
-                    ids = [frame_tree['frame']['id']]
-                    if 'childFrames' in frame_tree:
-                        for child in frame_tree['childFrames']:
-                            ids.extend(collect_frame_ids(child))
-                    return ids
-
-                frame_ids = collect_frame_ids(frames_data['frameTree'])
-                logger.info(f"📋 找到 {len(frame_ids)} 个 frames")
-
-                for frame_id in frame_ids:
-                    try:
-                        result = await cdp.send('Runtime.evaluate', {
-                            'expression': '''
-                                (() => {
-                                    const checkbox = document.querySelector('input[type="checkbox"]');
-                                    if (checkbox && !checkbox.checked) {
-                                        checkbox.click();
-                                        return 'clicked_checkbox';
-                                    }
-
-                                    const clickable = document.querySelector('[role="checkbox"]') ||
-                                                     document.querySelector('label') ||
-                                                     document.querySelector('span');
-                                    if (clickable) {
-                                        clickable.click();
-                                        return 'clicked_element';
-                                    }
-
-                                    return 'no_target';
-                                })()
-                            ''',
-                        })
-                        if result.get('result', {}).get('value') in ['clicked_checkbox', 'clicked_element']:
-                            logger.info("✅ 方法2: 在 frame 中成功触发点击")
-                            await asyncio.sleep(2)
-                            break
-                    except Exception:
-                        continue
-
-                await self.shot("07_method2_injected")
-
-            except Exception as e:
-                logger.info(f"ℹ️ 方法2 失败: {e}")
-
-            # 方法3: 模拟真实用户鼠标移动 + 点击
-            try:
-                logger.info("🖱️ 方法3: 模拟真实用户鼠标移动...")
-
-                iframe_info = await self.page.evaluate("""
-                    () => {
-                        const container = document.querySelector('.cf-turnstile');
-                        if (!container) return null;
-                        const iframe = container.querySelector('iframe');
-                        if (!iframe) return null;
-                        const rect = iframe.getBoundingClientRect();
-                        return {x: rect.x + 35, y: rect.y + rect.height/2};
-                    }
-                """)
-
-                if iframe_info:
-                    await self.page.mouse.move(100, 100)
-                    await asyncio.sleep(0.5)
-
-                    steps = 15
-                    current_x, current_y = 100, 100
-                    target_x, target_y = iframe_info['x'], iframe_info['y']
-
-                    for i in range(steps):
-                        x = current_x + (target_x - current_x) * (i + 1) / steps
-                        y = current_y + (target_y - current_y) * (i + 1) / steps
-                        await self.page.mouse.move(x, y)
-                        await asyncio.sleep(0.06)
-
-                    await self.page.mouse.down()
-                    await asyncio.sleep(0.15)
-                    await self.page.mouse.up()
-
-                    logger.info("✅ 方法3: 已模拟真实点击")
-                    await asyncio.sleep(3)
-                    await self.shot("07_method3_humanlike")
-
-            except Exception as e:
-                logger.info(f"ℹ️ 方法3 失败: {e}")
-
-            # 再顺带模拟一些页面滚动，增强“人类行为”
-            try:
-                await self.page.mouse.move(200, 200, steps=20)
-                await asyncio.sleep(0.4)
-                await self.page.evaluate("window.scrollBy(0, 300)")
-                await asyncio.sleep(0.6)
-                await self.page.evaluate("window.scrollBy(0, -200)")
-                await asyncio.sleep(0.5)
-            except Exception:
-                pass
-
-            # 等待验证完成
-            logger.info("⏳ 等待 Turnstile 验证完成...")
-
-            for i in range(max_wait):
-                await asyncio.sleep(1)
-
-                verification_status = await self.page.evaluate("""
-                    () => {
-                        const tokenField = document.querySelector('[name="cf-turnstile-response"]');
-                        const hasToken = tokenField && tokenField.value && tokenField.value.length > 0;
-
-                        const pageText = document.body.innerText || document.body.textContent;
-                        const hasSuccessText = pageText.includes('成功しました') || pageText.includes('成功');
-
-                        const container = document.querySelector('.cf-turnstile');
-                        let hasCheckmark = false;
-                        if (container) {
-                            const computedStyle = window.getComputedStyle(container);
-                            hasCheckmark = container.classList.contains('success') ||
-                                           container.classList.contains('verified') ||
-                                           container.querySelector('[aria-checked="true"]') !== null;
-                        }
-
-                        return {
-                            hasToken: hasToken,
-                            hasSuccessText: hasSuccessText,
-                            hasCheckmark: hasCheckmark,
-                            tokenLength: hasToken ? tokenField.value.length : 0,
-                            verified: hasToken || hasSuccessText || hasCheckmark
-                        };
-                    }
-                """)
-
-                if verification_status['verified']:
-                    logger.info(
-                        "✅ Cloudflare Turnstile 验证成功! "
-                        f"(令牌:{verification_status['hasToken']}, "
-                        f"文本:{verification_status['hasSuccessText']}, "
-                        f"对勾:{verification_status['hasCheckmark']})"
-                    )
-                    await self.shot("07_turnstile_success")
-                    return True
-
-                if i % 20 == 10:
-                    logger.info(f"🔄 重新尝试所有触发方法... ({i}/{max_wait}秒)")
-                    try:
-                        iframe_info = await self.page.evaluate("""
-                            () => {
-                                const container = document.querySelector('.cf-turnstile');
-                                if (!container) return null;
-                                const iframe = container.querySelector('iframe');
-                                if (!iframe) return null;
-                                const rect = iframe.getBoundingClientRect();
-                                return {x: rect.x + 35, y: rect.y + rect.height/2, visible: rect.width > 0};
-                            }
-                        """)
-                        if iframe_info and iframe_info['visible']:
-                            await self.page.mouse.click(iframe_info['x'], iframe_info['y'])
-                    except Exception:
-                        pass
-
-                if i % 10 == 0 and i > 0:
-                    status_parts = []
-                    if not verification_status['hasToken']:
-                        status_parts.append("等待令牌")
-                    if not verification_status['hasSuccessText']:
-                        status_parts.append("等待成功标志")
-                    if not verification_status['hasCheckmark']:
-                        status_parts.append("等待对勾")
-                    logger.info(
-                        f"⏳ Turnstile 验证中... ({i}/{max_wait}秒) "
-                        f"[{', '.join(status_parts) if status_parts else '检查中'}]"
-                    )
-
-            logger.warning(f"⚠️ Turnstile 验证超时({max_wait}秒)")
-            await self.shot("07_turnstile_timeout")
-
-            final_status = await self.page.evaluate("""
-                () => {
-                    const tokenField = document.querySelector('[name="cf-turnstile-response"]');
-                    return {
-                        hasToken: tokenField && tokenField.value && tokenField.value.length > 0,
-                        tokenValue: tokenField && tokenField.value
-                            ? tokenField.value.substring(0, 30) + '...'
-                            : 'empty',
-                    };
-                }
-            """)
-
-            if final_status['hasToken']:
-                logger.info(f"⚠️ 超时但检测到令牌({final_status['tokenValue']}),尝试继续")
-                return True
-
-            return False
-
+            
+            logger.info(f"🔍 Token 注入验证: {verification}")
+            
+            return success1 or success3
+            
         except Exception as e:
-            logger.error(f"❌ Turnstile 验证失败: {e}")
+            logger.error(f"❌ Token 注入失败: {e}")
             return False
 
-    # ---------- 提交续期表单 ----------
+    # ---------- 提交续期表单（优化版）----------
     async def submit_extend(self) -> bool:
-        """提交续期表单 - 支持在失败/未知时自动重试一次"""
+        """提交续期表单 - 优化 Turnstile 处理"""
 
         async def _read_captcha_image() -> Optional[str]:
             return await self.page.evaluate("""
@@ -904,38 +706,51 @@ Object.defineProperty(navigator, 'permissions', {
             """, code)
 
         try:
-            max_attempts = 2
+            max_attempts = 3
             for attempt in range(1, max_attempts + 1):
                 logger.info(f"📄 开始提交续期表单 (尝试 {attempt}/{max_attempts})")
                 await asyncio.sleep(3)
 
                 if attempt > 1:
-                    logger.info("🔄 正在刷新续期页面以获取新验证码和 Turnstile 状态...")
+                    logger.info("🔄 正在刷新续期页面以获取新验证码和 Turnstile...")
                     await self.page.reload()
-                    await asyncio.sleep(3)
+                    await asyncio.sleep(5)
 
-                # 在续期页面先模拟一些“人类行为”
-                logger.info("👤 在续期页面模拟用户行为以辅助 Turnstile 通过...")
-                try:
-                    await self.page.mouse.move(50, 50, steps=25)
-                    await asyncio.sleep(0.7)
-                    await self.page.mouse.move(200, 160, steps=20)
-                    await asyncio.sleep(0.6)
-                    await self.page.evaluate("window.scrollBy(0, 300)")
-                    await asyncio.sleep(0.8)
-                    await self.page.evaluate("window.scrollBy(0, -200)")
-                    await asyncio.sleep(0.6)
-                except Exception:
-                    pass
+                # 步骤 1: 获取 Turnstile sitekey
+                turnstile_info = await self.page.evaluate("""
+                    () => {
+                        const el = document.querySelector('.cf-turnstile');
+                        if (!el) return null;
+                        return {
+                            hasTurnstile: true,
+                            sitekey: el.getAttribute('data-sitekey'),
+                        };
+                    }
+                """)
 
-                # 步骤 1: Turnstile
-                logger.info("🔐 步骤1: 完成 Cloudflare Turnstile 验证...")
-                turnstile_success = await self.complete_turnstile_verification(max_wait=90)
-
-                if not turnstile_success:
-                    logger.warning("⚠️ Turnstile 验证未完全确认,但继续尝试提交...")
-
-                await asyncio.sleep(2)
+                if not turnstile_info or not turnstile_info.get('sitekey'):
+                    logger.warning("⚠️ 未检测到 Turnstile，跳过验证")
+                else:
+                    site_key = turnstile_info['sitekey']
+                    page_url = self.page.url
+                    
+                    logger.info(f"🔑 检测到 Turnstile sitekey: {site_key}")
+                    
+                    # 获取 token
+                    token = await self.turnstile_solver.solve(site_key, page_url, max_wait=90)
+                    
+                    if token:
+                        # 注入 token
+                        inject_success = await self.inject_turnstile_token(token)
+                        
+                        if inject_success:
+                            logger.info("✅ Turnstile token 注入成功")
+                            # 等待更长时间确保 token 生效
+                            await asyncio.sleep(5)
+                        else:
+                            logger.warning("⚠️ Token 注入失败，但继续尝试")
+                    else:
+                        logger.warning("⚠️ 未获取到 Turnstile token，但继续尝试")
 
                 # 步骤 2: 获取并识别验证码图片
                 logger.info("🔍 步骤2: 查找验证码图片...")
@@ -966,41 +781,34 @@ Object.defineProperty(navigator, 'permissions', {
                 if not input_filled:
                     raise Exception("未找到验证码输入框")
 
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
                 await self.shot(f"09_captcha_filled_attempt_{attempt}")
 
-                # 再模拟少量鼠标行为
-                try:
-                    await self.page.mouse.move(270, 300, steps=30)
-                    await asyncio.sleep(0.9)
-                    await self.page.mouse.move(420, 260, steps=20)
-                    await asyncio.sleep(0.7)
-                except Exception:
-                    pass
-
-                # 步骤 4: 最终确认 Turnstile 令牌
-                logger.info("🔍 步骤4: 最终确认 Turnstile 令牌...")
+                # 步骤 4: 最终确认 Turnstile token
+                logger.info("🔍 步骤4: 最终确认 Turnstile token...")
                 final_check = await self.page.evaluate("""
                     () => {
                         const tokenField = document.querySelector('[name="cf-turnstile-response"]');
-                        const successText = document.body.innerText || document.body.textContent;
                         return {
                             hasToken: tokenField && tokenField.value && tokenField.value.length > 0,
                             tokenLength: tokenField && tokenField.value ? tokenField.value.length : 0,
-                            hasSuccessText: successText.includes('成功')
+                            tokenPreview: tokenField && tokenField.value 
+                                ? tokenField.value.substring(0, 50) + '...'
+                                : 'empty'
                         };
                     }
                 """)
 
                 if final_check['hasToken']:
                     logger.info(
-                        f"✅ Turnstile 令牌确认 (长度: {final_check['tokenLength']}, "
-                        f"成功标志: {final_check['hasSuccessText']})"
+                        f"✅ Turnstile 令牌确认 (长度: {final_check['tokenLength']})"
                     )
+                    logger.info(f"📝 Token 预览: {final_check['tokenPreview']}")
                 else:
-                    logger.warning("⚠️ Turnstile 令牌缺失,提交可能失败")
+                    logger.warning("⚠️ Turnstile 令牌缺失，提交可能失败")
 
-                await asyncio.sleep(1)
+                # 等待更长时间确保所有验证完成
+                await asyncio.sleep(5)
 
                 # 步骤 5: 提交表单
                 logger.info("🖱️ 步骤5: 提交表单...")
@@ -1028,45 +836,59 @@ Object.defineProperty(navigator, 'permissions', {
                     logger.error("❌ 无法提交表单")
                     raise Exception("无法提交表单")
 
-                logger.info("✅ 表单已提交")
-                await asyncio.sleep(5)
+                logger.info("✅ 表单已提交，等待响应...")
+                await asyncio.sleep(8)
                 await self.shot(f"11_after_submit_attempt_{attempt}")
 
                 html = await self.page.content()
 
-                # 错误提示
-                if any(err in html for err in [
+                # 检查错误提示
+                error_keywords = [
                     "入力された認証コードが正しくありません",
                     "認証コードが正しくありません",
+                    "Turnstileの検証に失敗しました",
                     "エラー",
                     "間違"
-                ]):
-                    logger.error("❌ 验证码错误或 Turnstile 验证失败")
+                ]
+                
+                has_error = any(err in html for err in error_keywords)
+                
+                if has_error:
+                    logger.error(f"❌ 提交失败 (尝试 {attempt}/{max_attempts})")
                     await self.shot(f"11_error_attempt_{attempt}")
+                    
                     if attempt < max_attempts:
-                        logger.info("🔁 检测到错误，准备重新刷新验证码并重试提交")
+                        logger.info("🔁 检测到错误，准备重新刷新并重试...")
+                        await asyncio.sleep(3)
                         continue
+                    
                     self.renewal_status = "Failed"
-                    self.error_message = "验证码错误或 Turnstile 验证失败"
+                    self.error_message = "验证码或 Turnstile 验证失败"
                     return False
 
-                # 成功提示
-                if any(success in html for success in [
+                # 检查成功提示
+                success_keywords = [
                     "完了",
                     "継続",
                     "完成",
-                    "更新しました"
-                ]):
-                    logger.info("🎉 续期成功")
+                    "更新しました",
+                    "延長されました"
+                ]
+                
+                has_success = any(success in html for success in success_keywords)
+                
+                if has_success:
+                    logger.info("🎉 续期成功！")
                     self.renewal_status = "Success"
-                    # 再查一次新的到期日期
                     await self.get_expiry()
                     self.new_expiry_time = self.old_expiry_time
                     return True
 
-                logger.warning("⚠️ 续期提交结果未知")
+                logger.warning(f"⚠️ 续期提交结果未知 (尝试 {attempt}/{max_attempts})")
+                
                 if attempt < max_attempts:
-                    logger.info("🔁 结果未知，尝试重新提交一次...")
+                    logger.info("🔁 结果未知，尝试重新提交...")
+                    await asyncio.sleep(3)
                     continue
 
                 self.renewal_status = "Unknown"
@@ -1101,10 +923,9 @@ Object.defineProperty(navigator, 'permissions', {
             # 3. 获取当前到期时间
             await self.get_expiry()
 
-            # 3.5 自动判断是否已经续期 / 是否到可续期日（按 JST）
+            # 3.5 自动判断是否已经续期
             try:
                 if self.old_expiry_time:
-                    # 使用 JST 当前日期
                     today_jst = datetime.datetime.now(timezone(timedelta(hours=9))).date()
                     expiry_date = datetime.datetime.strptime(
                         self.old_expiry_time, "%Y-%m-%d"
@@ -1115,18 +936,12 @@ Object.defineProperty(navigator, 'permissions', {
                     logger.info(f"📅 到期日期: {expiry_date}")
                     logger.info(f"📅 可续期开始日: {can_extend_date}")
 
-                    # 规则：只有“到期前 1 天”起才能续期
                     if today_jst < can_extend_date:
-                        # 说明现在离可续期日还早（或者已经续过期，日期被推迟）
                         logger.info("ℹ️ 当前 VPS 尚未到可续期时间，无需续期。")
                         self.renewal_status = "Unexpired"
                         self.error_message = None
-
-                        # 保存缓存 & README
                         self.save_cache()
                         self.generate_readme()
-
-                        # 提示可续期日期
                         await Notifier.notify(
                             "ℹ️ 尚未到续期日",
                             f"当前利用期限: {self.old_expiry_time}\n"
@@ -1140,7 +955,7 @@ Object.defineProperty(navigator, 'permissions', {
             except Exception as e:
                 logger.error(f"❌ 自动判断是否需要续期失败: {e}")
 
-            # 4. 进入详情页,尝试点击"更新する"
+            # 4. 进入详情页
             await self.page.goto(Config.DETAIL_URL, timeout=Config.WAIT_TIMEOUT)
             await asyncio.sleep(2)
             await self.click_update()
@@ -1149,7 +964,6 @@ Object.defineProperty(navigator, 'permissions', {
             # 5. 打开续期页面
             opened = await self.open_extend()
             if not opened and self.renewal_status == "Unexpired":
-                # 未到续期时间
                 self.generate_readme()
                 await Notifier.notify("ℹ️ 尚未到期", f"当前到期时间: {self.old_expiry_time}")
                 return
@@ -1178,7 +992,6 @@ Object.defineProperty(navigator, 'permissions', {
             logger.info("=" * 60)
             logger.info(f"✅ 流程完成 - 状态: {self.renewal_status}")
             logger.info("=" * 60)
-            # 关闭浏览器 & playwright
             try:
                 if self.page:
                     await self.page.close()
